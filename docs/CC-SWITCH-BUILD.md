@@ -29,6 +29,30 @@ Results:
 
 The generated `node_modules` and `dist` directories are local submodule build outputs and are ignored by the upstream repository. They are not part of this repository's tracked source.
 
+## Personal proxy integration
+
+The replayable integration patch is `patches/cc-switch/0001-personal-proxy-integration.patch`.
+Use the repository script from PowerShell to export the pinned submodule into a fresh
+`.build` directory, apply the patch, and run the renderer checks:
+
+```powershell
+.\scripts\build-cc-switch.ps1 -Action Renderer
+.\scripts\build-cc-switch.ps1 -Action Test
+```
+
+The desktop action additionally requires the pinned Rust toolchain, Windows C++ build
+tools, and WebView2:
+
+```powershell
+.\scripts\build-cc-switch.ps1 -Action Desktop
+```
+
+The fork disables Tauri updater artifacts because it does not own the upstream signing
+key or update endpoint. The personal proxy page reads `/admin/status` through Rust with
+`CODEX_GATEWAY_ADMIN_TOKEN`; the token is never passed to JavaScript. Start/stop only
+controls the gateway child process that this application started, using the fixed
+`helpers/codex-gateway.exe` and `gateway.json` paths.
+
 ## Isolation boundary
 
 The submodule is intentionally pinned and is not treated as a public library. Its Tauri backend owns CC Switch's provider database and Codex configuration. Integration code must not independently write the same provider fields or use internal Rust modules as a stable API. Use a controlled fork or explicit external process boundary for future changes.

@@ -1,5 +1,6 @@
 .artifacts/
 .build/
+tests/WindowsRecovery/out/
 **/__pycache__/
 *.pyc
 

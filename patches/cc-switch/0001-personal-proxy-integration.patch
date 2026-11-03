@@ -1,0 +1,656 @@
+diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
+index 121d7a3..68b3ea7 100644
+--- a/src-tauri/src/lib.rs
++++ b/src-tauri/src/lib.rs
+@@ -37,6 +37,7 @@ mod omp_config;
+ mod openclaw_config;
+ mod opencode_config;
+ mod panic_hook;
++mod personal_proxy;
+ mod pi_config;
+ mod prompt;
+ mod prompt_files;
+@@ -1304,6 +1305,7 @@ pub fn run() {
+             );
+             // 将同一个实例注入到全局状态，避免重复创建导致的不一致
+             app.manage(app_state);
++            app.manage(personal_proxy::GatewayProcessState::default());
+             app.manage(services::kimi_oauth::KimiOAuthManager::default());
+ 
+             // 初始化 SkillService
+@@ -1572,6 +1574,10 @@ pub fn run() {
+             Ok(())
+         })
+         .invoke_handler(tauri::generate_handler![
++            personal_proxy::personal_proxy_status,
++            personal_proxy::personal_proxy_start_gateway,
++            personal_proxy::personal_proxy_stop_gateway,
++            personal_proxy::personal_proxy_open_helper,
+             commands::get_providers,
+             commands::get_current_provider,
+             commands::add_provider,
+@@ -2110,6 +2116,11 @@ pub fn run() {
+ /// 把接上代理的客户端都指回直连（模式和代理路由保留，下次启动再接上），再停止代理。
+ /// 客户端不能一直指着代理：开机自启默认关闭，CC Switch 一关客户端就连不上了。
+ pub async fn cleanup_before_exit(app_handle: &tauri::AppHandle) {
++    if let Some(process) = app_handle.try_state::<personal_proxy::GatewayProcessState>() {
++        if let Err(error) = personal_proxy::stop_owned_gateway(process.inner()) {
++            log::warn!("failed to stop owned personal proxy gateway: {error}");
++        }
++    }
+     if let Some(state) = app_handle.try_state::<store::AppState>() {
+         crate::mode::controller::detach_all(state.inner()).await;
+         log::info!("退出清理完成：客户端已指回直连，代理已停止");
+diff --git a/src-tauri/src/personal_proxy.rs b/src-tauri/src/personal_proxy.rs
+new file mode 100644
+index 0000000..102308d
+--- /dev/null
++++ b/src-tauri/src/personal_proxy.rs
+@@ -0,0 +1,228 @@
++//! Local integration boundary. No frontend argument can supply a command, path,
++//! URL, or credential. This module never touches Codex or proxy configuration.
++
++use serde::{Deserialize, Serialize};
++use std::{
++    net::IpAddr,
++    path::PathBuf,
++    process::{Child, Command, Stdio},
++    sync::Mutex,
++    time::Duration,
++};
++
++/// Owns only the gateway process started by this CC Switch instance.
++/// No process lookup or name-based termination is used.
++#[derive(Default)]
++pub struct GatewayProcessState(pub Mutex<Option<Child>>);
++
++#[derive(Serialize)]
++#[serde(rename_all = "camelCase")]
++pub struct PersonalProxyStatus {
++    gateway: &'static str,
++    ready: bool,
++    upstream_host: Option<String>,
++    helper_available: bool,
++    helper_supported: bool,
++    gateway_available: bool,
++    gateway_owned: bool,
++}
++
++#[derive(Deserialize)]
++struct GatewayStatus {
++    ready: bool,
++    upstream_host: String,
++}
++
++fn helper_path() -> Result<PathBuf, &'static str> {
++    let exe = std::env::current_exe().map_err(|_| "executable_path_unavailable")?;
++    let dir = exe.parent().ok_or("executable_path_unavailable")?;
++    Ok(dir.join("helpers").join("ChatGPTProxyManager.exe"))
++}
++
++fn gateway_binary_path() -> Result<PathBuf, &'static str> {
++    let exe = std::env::current_exe().map_err(|_| "executable_path_unavailable")?;
++    let dir = exe.parent().ok_or("executable_path_unavailable")?;
++    let name = if cfg!(target_os = "windows") {
++        "codex-gateway.exe"
++    } else {
++        "codex-gateway"
++    };
++    Ok(dir.join("helpers").join(name))
++}
++
++fn gateway_config_path() -> Result<PathBuf, &'static str> {
++    let exe = std::env::current_exe().map_err(|_| "executable_path_unavailable")?;
++    let dir = exe.parent().ok_or("executable_path_unavailable")?;
++    Ok(dir.join("gateway.json"))
++}
++
++fn gateway_owned_running(state: &GatewayProcessState) -> bool {
++    let Ok(mut process) = state.0.lock() else { return false; };
++    let Some(child) = process.as_mut() else { return false; };
++    match child.try_wait() {
++        Ok(None) => true,
++        Ok(Some(_)) | Err(_) => {
++            *process = None;
++            false
++        }
++    }
++}
++
++fn gateway_url() -> Result<url::Url, &'static str> {
++    let endpoint = std::env::var("CODEX_PROXY_GATEWAY_URL")
++        .unwrap_or_else(|_| "http://127.0.0.1:8787".to_string());
++    validate_gateway_url(&endpoint)
++}
++
++fn validate_gateway_url(endpoint: &str) -> Result<url::Url, &'static str> {
++    let mut parsed = url::Url::parse(endpoint).map_err(|_| "invalid_config")?;
++    let loopback = parsed.host_str().and_then(|host| host.trim_matches(['[', ']']).parse::<IpAddr>().ok())
++        .is_some_and(|ip| ip.is_loopback());
++    if parsed.scheme() != "http" || !loopback || !parsed.username().is_empty()
++        || parsed.password().is_some() || parsed.query().is_some() || parsed.fragment().is_some()
++        || parsed.path() != "/" {
++        return Err("invalid_config");
++    }
++    parsed.set_path("/admin/status");
++    Ok(parsed)
++}
++
++#[tauri::command]
++pub async fn personal_proxy_status(
++    process: tauri::State<'_, GatewayProcessState>,
++) -> Result<PersonalProxyStatus, String> {
++    let gateway_available = gateway_binary_path().is_ok_and(|path| path.is_file())
++        && gateway_config_path().is_ok_and(|path| path.is_file());
++    let gateway_owned = gateway_owned_running(&process);
++    let mut result = PersonalProxyStatus {
++        gateway: "unreachable", ready: false, upstream_host: None,
++        helper_available: cfg!(target_os = "windows") && helper_path().is_ok_and(|path| path.is_file()),
++        helper_supported: cfg!(target_os = "windows"),
++        gateway_available,
++        gateway_owned,
++    };
++    let endpoint = match gateway_url() {
++        Ok(endpoint) => endpoint,
++        Err(_) => { result.gateway = "invalid_config"; return Ok(result); }
++    };
++    // Credentials are read by the Rust backend only and never returned to JS.
++    let token = match std::env::var("CODEX_GATEWAY_ADMIN_TOKEN") {
++        Ok(token) if !token.trim().is_empty() => token,
++        _ => { result.gateway = "unauthorized"; return Ok(result); }
++    };
++    let client = reqwest::Client::builder().no_proxy()
++        .redirect(reqwest::redirect::Policy::none()).timeout(Duration::from_secs(3))
++        .build().map_err(|_| "local_client_unavailable".to_string())?;
++    let mut response = match client.get(endpoint).bearer_auth(token).send().await {
++        Ok(response) => response,
++        Err(_) => return Ok(result),
++    };
++    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
++        result.gateway = "unauthorized";
++        return Ok(result);
++    }
++    if !response.status().is_success() || response.content_length().is_some_and(|len| len > 16384) {
++        result.gateway = "invalid_response";
++        return Ok(result);
++    }
++    let mut body = Vec::new();
++    loop {
++        match response.chunk().await {
++            Ok(Some(chunk)) if body.len() + chunk.len() <= 16384 => body.extend_from_slice(&chunk),
++            Ok(None) => break,
++            _ => { result.gateway = "invalid_response"; return Ok(result); }
++        }
++    }
++    match serde_json::from_slice::<GatewayStatus>(&body) {
++        Ok(status) if status.upstream_host.len() <= 255 && !status.upstream_host.contains(['@', '/', '\\', '?', '#']) => {
++            result.ready = status.ready;
++            result.gateway = if status.ready { "ready" } else { "stopped" };
++            result.upstream_host = Some(status.upstream_host);
++        }
++        _ => result.gateway = "invalid_response",
++    }
++    Ok(result)
++}
++
++#[tauri::command]
++pub fn personal_proxy_start_gateway(
++    process: tauri::State<'_, GatewayProcessState>,
++) -> Result<(), String> {
++    let binary = gateway_binary_path().map_err(str::to_string)?;
++    let config = gateway_config_path().map_err(str::to_string)?;
++    if !binary.is_file() {
++        return Err("gateway_not_found".to_string());
++    }
++    if !config.is_file() {
++        return Err("gateway_config_not_found".to_string());
++    }
++    let mut slot = process.0.lock().map_err(|_| "gateway_state_unavailable")?;
++    if let Some(existing) = slot.as_mut() {
++        match existing.try_wait() {
++            Ok(None) => return Ok(()),
++            Ok(Some(_)) | Err(_) => *slot = None,
++        }
++    }
++    let child = Command::new(binary)
++        .arg("-config")
++        .arg(config)
++        .stdin(Stdio::null())
++        .stdout(Stdio::null())
++        .stderr(Stdio::null())
++        .spawn()
++        .map_err(|_| "gateway_start_failed".to_string())?;
++    *slot = Some(child);
++    Ok(())
++}
++
++#[tauri::command]
++pub fn personal_proxy_stop_gateway(
++    process: tauri::State<'_, GatewayProcessState>,
++) -> Result<(), String> {
++    stop_owned_gateway(process.inner()).map_err(str::to_string)
++}
++
++/// Stop only the child process recorded by this application instance.
++/// Existing gateway processes discovered by port/name are intentionally left alone.
++pub fn stop_owned_gateway(process: &GatewayProcessState) -> Result<(), &'static str> {
++    let mut slot = process.0.lock().map_err(|_| "gateway_state_unavailable".to_string())?;
++    let Some(mut child) = slot.take() else { return Ok(()); };
++    if child.try_wait().map_err(|_| "gateway_stop_failed")?.is_some() {
++        return Ok(());
++    }
++    child.kill().map_err(|_| "gateway_stop_failed")?;
++    let _ = child.wait();
++    Ok(())
++}
++
++#[tauri::command]
++pub fn personal_proxy_open_helper() -> Result<(), String> {
++    #[cfg(target_os = "windows")]
++    {
++        let path = helper_path().map_err(str::to_string)?;
++        if !path.is_file() { return Err("helper_not_found".to_string()); }
++        // Open the original visible WPF window, without --enable/--launch flags.
++        let mut child = std::process::Command::new(path).spawn()
++            .map_err(|_| "helper_start_failed".to_string())?;
++        // Reap only this child handle; never enumerate or terminate Codex processes.
++        std::thread::spawn(move || { let _ = child.wait(); });
++        Ok(())
++    }
++    #[cfg(not(target_os = "windows"))]
++    Err("helper_unsupported_platform".to_string())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::validate_gateway_url;
++
++    #[test]
++    fn gateway_endpoint_is_loopback_only() {
++        assert!(validate_gateway_url("http://127.0.0.1:8787").is_ok());
++        assert!(validate_gateway_url("http://[::1]:8787").is_ok());
++        for address in ["https://example.com", "http://localhost:8787", "http://127.0.0.1:8787/path",
++            "http://user:secret@127.0.0.1:8787", "http://127.0.0.1:8787?token=x"] {
++            assert!(validate_gateway_url(address).is_err(), "{address}");
++        }
++    }
++}
+diff --git a/src-tauri/src/proxy/forwarder.rs b/src-tauri/src/proxy/forwarder.rs
+index 79233af..d5d382e 100644
+--- a/src-tauri/src/proxy/forwarder.rs
++++ b/src-tauri/src/proxy/forwarder.rs
+@@ -5051,6 +5051,10 @@ mod tests {
+             headers: HashMap::from([
+                 ("User-Agent".to_string(), "custom".to_string()),
+                 ("X-Test".to_string(), "ok".to_string()),
++                (
++                    "X-Codex-Gateway-Token".to_string(),
++                    "Bearer local-gateway-token".to_string(),
++                ),
+                 ("Authorization".to_string(), "Bearer bad".to_string()),
+                 ("Content-Type".to_string(), "text/plain".to_string()),
+                 ("X-Bad".to_string(), "bad\nvalue".to_string()),
+@@ -5082,6 +5086,12 @@ mod tests {
+             headers.get("x-test").and_then(|value| value.to_str().ok()),
+             Some("ok")
+         );
++        assert_eq!(
++            headers
++                .get("x-codex-gateway-token")
++                .and_then(|value| value.to_str().ok()),
++            Some("Bearer local-gateway-token")
++        );
+         assert!(headers.get("x-bad").is_none());
+     }
+ 
+diff --git a/src-tauri/tauri.conf.json b/src-tauri/tauri.conf.json
+index 188a346..19147ca 100644
+--- a/src-tauri/tauri.conf.json
++++ b/src-tauri/tauri.conf.json
+@@ -38,7 +38,7 @@
+   "bundle": {
+     "active": true,
+     "targets": "all",
+-    "createUpdaterArtifacts": true,
++    "createUpdaterArtifacts": false,
+     "icon": [
+       "icons/32x32.png",
+       "icons/128x128.png",
+diff --git a/src/App.tsx b/src/App.tsx
+index 0a60d9a..50ec792 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -92,6 +92,7 @@ import { SettingsPage } from "@/components/settings/SettingsPage";
+ import { AuthCenterPanel } from "@/components/settings/AuthCenterPanel";
+ import { RefreshAllQuotaButton } from "@/components/settings/auth/RefreshAllQuotaButton";
+ import { AppsPage } from "@/components/apps/AppsPage";
++import { PersonalProxyPage } from "@/components/personal-proxy/PersonalProxyPage";
+ import {
+   checkToolUpdatesInBackground,
+   useToolUpdatesAvailable,
+@@ -1735,6 +1736,8 @@ function App() {
+         );
+       case "apps":
+         return <AppsPage />;
++      case "personalProxy":
++        return <PersonalProxyPage />;
+       default:
+         return null;
+     }
+diff --git a/src/components/personal-proxy/PersonalProxyPage.tsx b/src/components/personal-proxy/PersonalProxyPage.tsx
+new file mode 100644
+index 0000000..0ccd978
+--- /dev/null
++++ b/src/components/personal-proxy/PersonalProxyPage.tsx
+@@ -0,0 +1,185 @@
++import { useEffect, useState } from "react";
++import { invoke } from "@tauri-apps/api/core";
++import {
++  RefreshCw,
++  ExternalLink,
++  ShieldCheck,
++  Play,
++  Square,
++} from "lucide-react";
++import { Button } from "@/components/ui/button";
++
++export interface PersonalProxyStatus {
++  gateway: string;
++  ready: boolean;
++  upstreamHost: string | null;
++  helperAvailable: boolean;
++  helperSupported: boolean;
++  gatewayAvailable: boolean;
++  gatewayOwned: boolean;
++}
++
++const STATUS_LABELS: Record<string, string> = {
++  ready: "网关已就绪",
++  stopped: "网关尚未就绪",
++  unreachable: "无法连接本地网关，请确认网关已启动",
++  unauthorized: "本机管理令牌未配置或不匹配，请检查启动环境",
++  invalid_config: "网关地址配置无效，仅支持本机回环 HTTP 地址",
++  invalid_response: "网关返回了不兼容的状态响应",
++};
++
++export function PersonalProxyPage() {
++  const [status, setStatus] = useState<PersonalProxyStatus | null>(null);
++  const [busy, setBusy] = useState(false);
++  const [message, setMessage] = useState("");
++
++  const refresh = async () => {
++    setBusy(true);
++    setMessage("");
++    try {
++      setStatus(await invoke<PersonalProxyStatus>("personal_proxy_status"));
++    } catch {
++      setMessage("无法读取本机状态，请重试或检查应用构建版本。");
++    } finally {
++      setBusy(false);
++    }
++  };
++
++  useEffect(() => {
++    void refresh();
++  }, []);
++
++  const openHelper = async () => {
++    setBusy(true);
++    setMessage("");
++    try {
++      await invoke("personal_proxy_open_helper");
++      setMessage("已打开代理启动器窗口。请在该窗口检查设置后操作。");
++    } catch {
++      setMessage(
++        "无法打开代理启动器，请检查发布包中 helpers 目录的程序是否存在。",
++      );
++    } finally {
++      setBusy(false);
++    }
++  };
++
++  const setGatewayRunning = async (running: boolean) => {
++    setBusy(true);
++    setMessage("");
++    try {
++      await invoke(
++        running
++          ? "personal_proxy_start_gateway"
++          : "personal_proxy_stop_gateway",
++      );
++      await refresh();
++      setMessage(
++        running
++          ? "已启动本应用管理的本地网关。"
++          : "已停止本应用管理的本地网关。",
++      );
++    } catch {
++      setMessage(
++        running
++          ? "无法启动网关，请检查发布包中的 gateway.json 和网关程序。"
++          : "无法停止本应用管理的网关。",
++      );
++    } finally {
++      setBusy(false);
++    }
++  };
++
++  return (
++    <section
++      id="main-content"
++      className="flex min-h-0 flex-1 flex-col overflow-y-auto p-6"
++    >
++      <div className="mb-6 flex items-center justify-between gap-3">
++        <div>
++          <h1 className="text-xl font-semibold text-fg-1">个人代理工具</h1>
++          <p className="mt-1 text-sm text-fg-2">
++            查看本地网关，打开原代理启动器。模型线路仍在 Codex 供应商页面选择。
++          </p>
++        </div>
++        <Button
++          variant="outline"
++          onClick={() => void refresh()}
++          disabled={busy}
++        >
++          <RefreshCw className="mr-2 h-4 w-4" />
++          刷新状态
++        </Button>
++      </div>
++      <div className="grid gap-4 md:grid-cols-2">
++        <div className="rounded-lg border border-border bg-surface p-5">
++          <h2 className="mb-3 flex items-center gap-2 font-medium">
++            <ShieldCheck className="h-4 w-4" />
++            本地模型网关
++          </h2>
++          <p role="status" className="text-sm text-fg-1">
++            {status
++              ? (STATUS_LABELS[status.gateway] ?? "未知状态")
++              : "正在读取状态…"}
++          </p>
++          {status?.upstreamHost && (
++            <p className="mt-2 break-all text-sm text-fg-2">
++              已配置上游：{status.upstreamHost}
++            </p>
++          )}
++          <p className="mt-3 text-sm text-fg-2">
++            网关就绪仅表示本机服务可用，不代表上游请求或官方账号功能已验证。
++          </p>
++          <div className="mt-4 flex flex-wrap gap-2">
++            <Button
++              variant="outline"
++              onClick={() => void setGatewayRunning(true)}
++              disabled={
++                busy || !status?.gatewayAvailable || status.gatewayOwned
++              }
++            >
++              <Play className="mr-2 h-4 w-4" />
++              启动网关
++            </Button>
++            <Button
++              variant="outline"
++              onClick={() => void setGatewayRunning(false)}
++              disabled={busy || !status?.gatewayOwned}
++            >
++              <Square className="mr-2 h-4 w-4" />
++              停止网关
++            </Button>
++          </div>
++          <p className="mt-2 text-xs text-fg-2">
++            {status?.gatewayOwned
++              ? "当前网关由本应用启动并可由此停止。"
++              : "未由本应用启动的同名进程不会被停止。"}
++          </p>
++        </div>
++        <div className="rounded-lg border border-border bg-surface p-5">
++          <h2 className="mb-3 font-medium">Windows 代理启动器</h2>
++          <p className="mb-4 text-sm text-fg-2">
++            {status?.helperSupported === false
++              ? "当前系统不支持 Windows 启动器。"
++              : status?.helperAvailable
++                ? "已找到代理启动器，点击后打开独立原窗口。"
++                : "尚未找到代理启动器，请检查发布包。"}
++          </p>
++          <Button
++            variant="outline"
++            onClick={() => void openHelper()}
++            disabled={busy || !status?.helperAvailable}
++          >
++            <ExternalLink className="mr-2 h-4 w-4" />
++            打开代理启动器
++          </Button>
++        </div>
++      </div>
++      {message && (
++        <p role="alert" className="mt-4 text-sm text-fg-2">
++          {message}
++        </p>
++      )}
++    </section>
++  );
++}
+diff --git a/src/components/shell/Sidebar.tsx b/src/components/shell/Sidebar.tsx
+index f881429..cde2fa1 100644
+--- a/src/components/shell/Sidebar.tsx
++++ b/src/components/shell/Sidebar.tsx
+@@ -273,6 +273,7 @@ function MainDirectory({
+     trailingLabel?: string;
+     alert?: string;
+   }[] = [
++    { page: "personalProxy", label: "个人代理工具", icon: Route },
+     { page: "mcp", label: "MCP", icon: Server },
+     { page: "skills", label: "Skills", icon: SkillsIcon },
+     { page: "prompts", label: t("nav.prompts"), icon: BookOpen },
+diff --git a/src/lib/navigation.ts b/src/lib/navigation.ts
+index f80c636..54b201e 100644
+--- a/src/lib/navigation.ts
++++ b/src/lib/navigation.ts
+@@ -22,6 +22,7 @@ export type GlobalPage =
+   | "skillsDiscovery"
+   | "prompts"
+   | "sessions"
++  | "personalProxy"
+   | "apps";
+ 
+ export type View = AppPage | GlobalPage | "settings";
+@@ -58,6 +59,7 @@ const GLOBAL_PAGES: GlobalPage[] = [
+   "skillsDiscovery",
+   "prompts",
+   "sessions",
++  "personalProxy",
+   "apps",
+ ];
+ 
+diff --git a/tests/components/PersonalProxyPage.test.tsx b/tests/components/PersonalProxyPage.test.tsx
+new file mode 100644
+index 0000000..5f88655
+--- /dev/null
++++ b/tests/components/PersonalProxyPage.test.tsx
+@@ -0,0 +1,88 @@
++import { beforeEach, describe, expect, it, vi } from "vitest";
++import { fireEvent, render, screen, waitFor } from "@testing-library/react";
++import { PersonalProxyPage } from "@/components/personal-proxy/PersonalProxyPage";
++
++const invoke = vi.fn();
++vi.mock("@tauri-apps/api/core", () => ({
++  invoke: (...args: unknown[]) => invoke(...args),
++}));
++
++describe("PersonalProxyPage", () => {
++  beforeEach(() => {
++    invoke.mockReset();
++  });
++
++  it("shows verified service status without requesting credentials in JS", async () => {
++    invoke.mockResolvedValue({
++      gateway: "ready",
++      ready: true,
++      upstreamHost: "test.example",
++      helperAvailable: true,
++      helperSupported: true,
++      gatewayAvailable: true,
++      gatewayOwned: false,
++    });
++    render(<PersonalProxyPage />);
++    expect(await screen.findByText("网关已就绪")).toBeInTheDocument();
++    expect(screen.getByText("已配置上游：test.example")).toBeInTheDocument();
++    expect(invoke).toHaveBeenCalledWith("personal_proxy_status");
++    fireEvent.click(screen.getByRole("button", { name: "打开代理启动器" }));
++    await waitFor(() =>
++      expect(invoke).toHaveBeenCalledWith("personal_proxy_open_helper"),
++    );
++    expect(await screen.findByRole("alert")).toHaveTextContent(
++      "已打开代理启动器窗口",
++    );
++  });
++
++  it("shows an actionable unavailable state and disables a missing helper", async () => {
++    invoke.mockResolvedValue({
++      gateway: "unreachable",
++      ready: false,
++      upstreamHost: null,
++      helperAvailable: false,
++      helperSupported: true,
++      gatewayAvailable: false,
++      gatewayOwned: false,
++    });
++    render(<PersonalProxyPage />);
++    expect(
++      await screen.findByText("无法连接本地网关，请确认网关已启动"),
++    ).toBeInTheDocument();
++    expect(
++      screen.getByRole("button", { name: "打开代理启动器" }),
++    ).toBeDisabled();
++  });
++
++  it("starts and stops only the app-owned gateway", async () => {
++    let owned = false;
++    const status = () => ({
++      gateway: "stopped",
++      ready: false,
++      upstreamHost: "test.example",
++      helperAvailable: false,
++      helperSupported: true,
++      gatewayAvailable: true,
++      gatewayOwned: owned,
++    });
++    invoke.mockImplementation(async (command: string) => {
++      if (command === "personal_proxy_status") return status();
++      if (command === "personal_proxy_start_gateway") owned = true;
++      if (command === "personal_proxy_stop_gateway") owned = false;
++      return undefined;
++    });
++    render(<PersonalProxyPage />);
++    expect(await screen.findByText("网关尚未就绪")).toBeInTheDocument();
++    fireEvent.click(screen.getByRole("button", { name: "启动网关" }));
++    await waitFor(() =>
++      expect(invoke).toHaveBeenCalledWith("personal_proxy_start_gateway"),
++    );
++    await waitFor(() =>
++      expect(screen.getByRole("button", { name: "停止网关" })).toBeEnabled(),
++    );
++    fireEvent.click(screen.getByRole("button", { name: "停止网关" }));
++    await waitFor(() =>
++      expect(invoke).toHaveBeenCalledWith("personal_proxy_stop_gateway"),
++    );
++  });
++});
