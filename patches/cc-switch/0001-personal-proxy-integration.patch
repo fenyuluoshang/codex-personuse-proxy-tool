@@ -276,10 +276,65 @@ index 0000000..102308d
 +    }
 +}
 diff --git a/src-tauri/src/proxy/forwarder.rs b/src-tauri/src/proxy/forwarder.rs
-index 79233af..d5d382e 100644
+index 79233af..4217e0b 100644
 --- a/src-tauri/src/proxy/forwarder.rs
 +++ b/src-tauri/src/proxy/forwarder.rs
-@@ -5051,6 +5051,10 @@ mod tests {
+@@ -2703,6 +2703,7 @@ impl RequestForwarder {
+                 .and_then(|meta| meta.local_proxy_request_overrides.as_ref()),
+             is_copilot,
+         );
++        apply_local_gateway_token(&mut ordered_headers, &url, is_copilot);
+ 
+         // 托管 OAuth 的 workspace 由账号绑定决定，覆盖客户端或本地代理配置的旧值。
+         if let Some(ref account_id) = codex_oauth_account_id {
+@@ -4463,6 +4464,38 @@ fn apply_local_proxy_header_overrides(
+     }
+ }
+ 
++/// Inject the gateway client token only at the Rust boundary for a numeric
++/// loopback HTTP target. The token is read from the process environment and is
++/// never stored in ProviderMeta, the provider database, or JavaScript.
++fn apply_local_gateway_token(
++    headers: &mut http::HeaderMap,
++    url: &url::Url,
++    is_copilot: bool,
++) {
++    if is_copilot || url.scheme() != "http" {
++        return;
++    }
++    let Some(host) = url.host_str() else { return; };
++    let Ok(ip) = host.parse::<std::net::IpAddr>() else { return; };
++    if !ip.is_loopback() {
++        return;
++    }
++    let Ok(token) = std::env::var("CODEX_GATEWAY_CLIENT_TOKEN") else {
++        return;
++    };
++    let token = token.trim();
++    if token.is_empty() {
++        return;
++    }
++    let value = format!("Bearer {token}");
++    if let Ok(value) = http::HeaderValue::from_str(&value) {
++        headers.insert(
++            http::HeaderName::from_static("x-codex-gateway-token"),
++            value,
++        );
++    }
++}
++
+ fn is_protected_local_proxy_override_header(name: &http::HeaderName) -> bool {
+     matches!(
+         name.as_str(),
+@@ -4481,6 +4514,7 @@ fn is_protected_local_proxy_override_header(name: &http::HeaderName) -> bool {
+             | "x-api-key"
+             | "x-goog-api-key"
+             | "chatgpt-account-id"
++            | "x-codex-gateway-token"
+             | "session_id"
+             | "x-client-request-id"
+             | "x-codex-window-id"
+@@ -5051,6 +5085,10 @@ mod tests {
              headers: HashMap::from([
                  ("User-Agent".to_string(), "custom".to_string()),
                  ("X-Test".to_string(), "ok".to_string()),
@@ -290,19 +345,47 @@ index 79233af..d5d382e 100644
                  ("Authorization".to_string(), "Bearer bad".to_string()),
                  ("Content-Type".to_string(), "text/plain".to_string()),
                  ("X-Bad".to_string(), "bad\nvalue".to_string()),
-@@ -5082,6 +5086,12 @@ mod tests {
+@@ -5082,6 +5120,7 @@ mod tests {
              headers.get("x-test").and_then(|value| value.to_str().ok()),
              Some("ok")
          );
++        assert!(headers.get("x-codex-gateway-token").is_none());
+         assert!(headers.get("x-bad").is_none());
+     }
+ 
+@@ -5107,6 +5146,32 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn gateway_token_is_injected_only_for_numeric_loopback_targets() {
++        std::env::set_var("CODEX_GATEWAY_CLIENT_TOKEN", "rust-only-token");
++        let mut headers = http::HeaderMap::new();
++        apply_local_gateway_token(
++            &mut headers,
++            &url::Url::parse("http://127.0.0.1:8787/v1/responses").unwrap(),
++            false,
++        );
 +        assert_eq!(
 +            headers
 +                .get("x-codex-gateway-token")
 +                .and_then(|value| value.to_str().ok()),
-+            Some("Bearer local-gateway-token")
++            Some("Bearer rust-only-token")
 +        );
-         assert!(headers.get("x-bad").is_none());
-     }
- 
++
++        let mut external = http::HeaderMap::new();
++        apply_local_gateway_token(
++            &mut external,
++            &url::Url::parse("https://provider.example/v1/responses").unwrap(),
++            false,
++        );
++        assert!(external.get("x-codex-gateway-token").is_none());
++        std::env::remove_var("CODEX_GATEWAY_CLIENT_TOKEN");
++    }
++
+     #[tokio::test]
+     async fn non_streaming_success_is_buffered_before_marking_provider_successful() {
+         let forwarder = test_forwarder(Duration::from_secs(1), Duration::from_secs(1));
 diff --git a/src-tauri/tauri.conf.json b/src-tauri/tauri.conf.json
 index 188a346..19147ca 100644
 --- a/src-tauri/tauri.conf.json

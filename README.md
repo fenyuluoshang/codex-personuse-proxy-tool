@@ -30,7 +30,7 @@ Pop-Location
 go run ./cmd/gateway -config ./gateway.json
 ```
 
-将 CC Switch 选定的第三方供应商指向 `http://127.0.0.1:8787/v1` 并设置 `X-Codex-Gateway-Token: Bearer <本机令牌>`；实际串接仍需按已安装版本验证。第三方上游认证与本机访问令牌独立设置，参见 [网关说明](docs/gateway.md)。
+将 CC Switch 选定的第三方供应商指向 `http://127.0.0.1:8787/v1`。集成补丁会在 Rust 后端发现 numeric loopback HTTP 目标时，从 `CODEX_GATEWAY_CLIENT_TOKEN` 运行时环境变量注入 `X-Codex-Gateway-Token`；该令牌不会写入 ProviderMeta、数据库或 JavaScript。实际串接仍需按已安装版本验证。第三方上游认证与本机访问令牌独立设置，参见 [网关说明](docs/gateway.md)。
 
 网关默认拒绝缺失本机令牌、未知接口和错误方法。健康检查可访问 `/healthz`；管理状态 `/admin/status` 需要独立管理令牌。网关不会读取官方登录缓存或自动修改 Codex 配置。
 

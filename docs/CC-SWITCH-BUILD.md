@@ -51,7 +51,9 @@ The fork disables Tauri updater artifacts because it does not own the upstream s
 key or update endpoint. The personal proxy page reads `/admin/status` through Rust with
 `CODEX_GATEWAY_ADMIN_TOKEN`; the token is never passed to JavaScript. Start/stop only
 controls the gateway child process that this application started, using the fixed
-`helpers/codex-gateway.exe` and `gateway.json` paths.
+`helpers/codex-gateway.exe` and `gateway.json` paths. The forwarder injects
+`X-Codex-Gateway-Token` from `CODEX_GATEWAY_CLIENT_TOKEN` only for numeric loopback HTTP
+targets; the protected header cannot be supplied through provider metadata.
 
 ## Isolation boundary
 

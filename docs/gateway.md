@@ -10,7 +10,7 @@ go run ./cmd/gateway -config .\gateway.json
 
 配置文件参见 [`gateway.example.json`](../gateway.example.json)。`upstream` 必须是明确的 `http` 或 `https` URL，且其 `host:port` 必须出现在 `allowed_upstream_hosts` 中。网关拒绝将上游配置为自己的监听地址，防止简单的代理循环。`allowed_paths` 是模型接口路径白名单，未知路径返回 `404 path_not_allowed`，不会被发送到上游；模型列表仅接受 GET，Responses 接口仅接受 POST。
 
-启动前设置 `client_token_env` 指定的随机本机令牌，并让 CC Switch 的第三方供应商配置携带 `X-Codex-Gateway-Token: Bearer <本机令牌>`（头名可配置）。网关缺少令牌时拒绝转发；该头不会送到上游。代理站的 `Authorization` 是另一份凭据，仍由下面的第三方认证策略控制。不要把官方账户令牌当成本机令牌。
+启动前设置 `client_token_env` 指定的随机本机令牌。集成补丁的 CC Switch Rust forwarder 会在目标是 numeric loopback HTTP 地址时从同一环境变量注入 `X-Codex-Gateway-Token: Bearer <本机令牌>`；它不会写入 ProviderMeta、数据库或 JavaScript。网关缺少令牌时拒绝转发；该头不会送到上游。代理站的 `Authorization` 是另一份凭据，仍由下面的第三方认证策略控制。不要把官方账户令牌当成本机令牌。
 
 默认会删除客户端的 `Authorization`、`ChatGPT-Account-ID`、Cookie、代理认证、OpenAI 账户头和 ChatGPT 账户头。第三方供应商需要 `Authorization` 时，只有在确认 CC Switch 已经用第三方凭据替换该头后，才可以设置 `forward_authorization: true`。更推荐使用 `headers_from_env` 注入代理站专用的自定义 API 头，例如 `X-API-Key`，避免把官方令牌带入第三方链路。
 
