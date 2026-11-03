@@ -11,7 +11,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -243,36 +242,57 @@ func writeSSE(w http.ResponseWriter, r *http.Request, chunkDelay time.Duration, 
 		writeError(w, http.StatusInternalServerError, "streaming_not_supported")
 		return
 	}
-	payload, _ := json.Marshal(responsePayload())
-	if chunkSize <= 0 {
-		chunkSize = len(payload)
-	}
 	w.WriteHeader(http.StatusOK)
-	for i := 0; i < len(payload); i += chunkSize {
-		end := i + chunkSize
-		if end > len(payload) {
-			end = len(payload)
+	// Emit complete Responses lifecycle events. chunk_size controls network byte
+	// fragments, deliberately including fragments inside JSON and SSE boundaries.
+	for sequence, event := range responseEvents() {
+		event["sequence_number"] = sequence
+		payload, _ := json.Marshal(event)
+		frame := []byte(fmt.Sprintf("event: %s\ndata: %s\n\n", event["type"], payload))
+		size := chunkSize
+		if size <= 0 {
+			size = len(frame)
 		}
-		chunk, _ := json.Marshal(map[string]any{"type": "response.output_text.delta", "delta": string(payload[i:end])})
-		if _, err := fmt.Fprintf(w, "data: %s\n\n", chunk); err != nil {
-			return
-		}
-		f.Flush()
-		if chunkDelay > 0 && !sleepOrCancel(w, r, chunkDelay) {
-			return
+		for i := 0; i < len(frame); i += size {
+			end := i + size
+			if end > len(frame) {
+				end = len(frame)
+			}
+			if _, err := w.Write(frame[i:end]); err != nil {
+				return
+			}
+			f.Flush()
+			if !sleepOrCancel(w, r, chunkDelay) {
+				return
+			}
 		}
 	}
-	fmt.Fprint(w, "data: [DONE]\n\n")
-	f.Flush()
+}
+
+func responseEvents() []map[string]any {
+	part := map[string]any{"type": "output_text", "text": "mock response", "annotations": []any{}}
+	item := map[string]any{"id": "msg_mock_1", "type": "message", "role": "assistant", "status": "completed", "content": []any{part}}
+	return []map[string]any{
+		{"type": "response.created", "response": map[string]any{"id": "resp_mock_1", "object": "response", "status": "in_progress", "output": []any{}}},
+		{"type": "response.output_item.added", "output_index": 0, "item": map[string]any{"id": "msg_mock_1", "type": "message", "role": "assistant", "status": "in_progress", "content": []any{}}},
+		{"type": "response.content_part.added", "item_id": "msg_mock_1", "output_index": 0, "content_index": 0, "part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}}},
+		{"type": "response.output_text.delta", "item_id": "msg_mock_1", "output_index": 0, "content_index": 0, "delta": "mock "},
+		{"type": "response.output_text.delta", "item_id": "msg_mock_1", "output_index": 0, "content_index": 0, "delta": "response"},
+		{"type": "response.output_text.done", "item_id": "msg_mock_1", "output_index": 0, "content_index": 0, "text": "mock response"},
+		{"type": "response.content_part.done", "item_id": "msg_mock_1", "output_index": 0, "content_index": 0, "part": part},
+		{"type": "response.output_item.done", "output_index": 0, "item": item},
+		{"type": "response.completed", "response": responsePayload()},
+	}
 }
 
 func responsePayload() map[string]any {
 	return map[string]any{
 		"id": "resp_mock_1", "object": "response", "status": "completed", "model": "mock-model",
 		"output": []any{map[string]any{
-			"type": "message", "role": "assistant",
-			"content": []any{map[string]any{"type": "output_text", "text": "mock response"}},
+			"id": "msg_mock_1", "type": "message", "role": "assistant", "status": "completed",
+			"content": []any{map[string]any{"type": "output_text", "text": "mock response", "annotations": []any{}}},
 		}},
+		"usage": map[string]any{"input_tokens": 1, "output_tokens": 2, "total_tokens": 3, "input_tokens_details": map[string]any{"cached_tokens": 0}, "output_tokens_details": map[string]any{"reasoning_tokens": 0}},
 	}
 }
 
@@ -299,7 +319,3 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 func writeError(w http.ResponseWriter, status int, code string) {
 	writeJSON(w, status, map[string]any{"error": map[string]any{"type": "mock_error", "code": code, "message": strings.ReplaceAll(code, "_", " ")}})
 }
-
-// Keep numeric parsing available for future fixture flags without changing the
-// package surface.
-var _ = strconv.IntSize

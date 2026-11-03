@@ -23,8 +23,27 @@ func TestResponsesRedactsCredentialAndReturnsSSE(t *testing.T) {
 		t.Fatalf("content type = %q", ct)
 	}
 	body, _ := io.ReadAll(w.Result().Body)
-	if !strings.Contains(string(body), "[DONE]") {
-		t.Fatalf("missing done event: %s", body)
+	if !strings.Contains(string(body), "event: response.completed") {
+		t.Fatalf("missing completed event: %s", body)
+	}
+	if !strings.Contains(string(body), `"delta":"mock "`) || !strings.Contains(string(body), `"delta":"response"`) {
+		t.Fatal("output_text.delta must contain text, not fragments of the response JSON")
+	}
+	var types []string
+	for _, frame := range strings.Split(string(body), "\n\n") {
+		for _, line := range strings.Split(frame, "\n") {
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			var event map[string]any
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &event); err != nil {
+				t.Fatalf("invalid SSE JSON after reassembling network fragments: %v", err)
+			}
+			types = append(types, event["type"].(string))
+		}
+	}
+	if len(types) != 9 || types[0] != "response.created" || types[len(types)-1] != "response.completed" {
+		t.Fatalf("unexpected lifecycle: %v", types)
 	}
 
 	s.state.mu.RLock()

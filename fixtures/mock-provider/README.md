@@ -36,5 +36,11 @@ Invoke-RestMethod http://127.0.0.1:18080/__mock/config -Method Put `
   -ContentType 'application/json' -Body '{"stream":false}'
 ```
 
+SSE uses Responses lifecycle events, from `response.created` to
+`response.completed`, including text deltas and the final assistant message.
+`chunk_size` controls the number of bytes written and flushed at a time, so JSON
+and SSE boundaries can cross network fragments. It does not split response JSON
+into text deltas. This supports the real CLI probe in `scripts/verify-codex.py`.
+
 The fixture binds to loopback by default. Do not change `-addr` to a public
 interface in shared or untrusted environments.
