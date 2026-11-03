@@ -1,0 +1,12 @@
+{
+  "listen": "127.0.0.1:8787",
+  "upstream": "https://provider.example/v1",
+  "allowed_upstream_hosts": ["provider.example"],
+  "forward_authorization": false,
+  "static_headers": {},
+  "headers_from_env": {
+    "X-API-Key": "CODEX_GATEWAY_API_KEY"
+  },
+  "request_timeout_seconds": 120,
+  "read_header_timeout_seconds": 15
+}
