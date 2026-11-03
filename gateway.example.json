@@ -2,6 +2,15 @@
   "listen": "127.0.0.1:8787",
   "upstream": "https://provider.example/v1",
   "allowed_upstream_hosts": ["provider.example"],
+  "allowed_paths": [
+    "/v1/responses",
+    "/v1/responses/compact",
+    "/v1/models"
+  ],
+  "client_token_env": "CODEX_GATEWAY_CLIENT_TOKEN",
+  "client_token_header": "X-Codex-Gateway-Token",
+  "admin_token_env": "CODEX_GATEWAY_ADMIN_TOKEN",
+  "outbound_proxy_env": "",
   "forward_authorization": false,
   "static_headers": {},
   "headers_from_env": {

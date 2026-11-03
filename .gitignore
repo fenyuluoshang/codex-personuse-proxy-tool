@@ -1,0 +1,9 @@
+/build/
+/.build/
+/dist/
+/artifacts/
+/gateway.json
+*.local.json
+__pycache__/
+*.pyc
+
