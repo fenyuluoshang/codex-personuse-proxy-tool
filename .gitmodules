@@ -1,0 +1,6 @@
+[submodule "upstream/cc-switch"]
+	path = upstream/cc-switch
+	url = https://github.com/farion1231/cc-switch.git
+[submodule "third_party/chatgpt-proxy-manager"]
+	path = third_party/chatgpt-proxy-manager
+	url = https://github.com/xztsummer/chatgpt-proxy-manager.git
