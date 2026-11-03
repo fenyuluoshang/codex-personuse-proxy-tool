@@ -11,6 +11,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -22,7 +23,7 @@ type Gateway struct {
 	proxy   *httputil.ReverseProxy
 	server  *http.Server
 	logger  *slog.Logger
-	started bool
+	started atomic.Bool
 }
 
 func New(c Config, logger *slog.Logger) (*Gateway, error) {
@@ -43,6 +44,7 @@ func New(c Config, logger *slog.Logger) (*Gateway, error) {
 		MaxIdleConns:          32,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   15 * time.Second,
+		ResponseHeaderTimeout: time.Duration(c.RequestTimeoutSeconds) * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
 	g.proxy.ModifyResponse = g.modifyResponse
@@ -67,7 +69,7 @@ func (g *Gateway) Serve(l net.Listener) error {
 	if !isLoopbackListener(l.Addr()) {
 		return fmt.Errorf("gateway listener %q is not loopback", l.Addr().String())
 	}
-	g.started = true
+	g.started.Store(true)
 	return g.server.Serve(l)
 }
 
@@ -86,7 +88,7 @@ func (g *Gateway) Shutdown(ctx context.Context) error {
 	if g.server == nil {
 		return nil
 	}
-	g.started = false
+	g.started.Store(false)
 	return g.server.Shutdown(ctx)
 }
 
@@ -98,7 +100,7 @@ func (g *Gateway) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/readyz" {
 		status := "ready"
 		code := http.StatusOK
-		if !g.started {
+		if !g.started.Load() {
 			status = "stopped"
 			code = http.StatusServiceUnavailable
 		}
