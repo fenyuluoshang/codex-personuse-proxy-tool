@@ -43,7 +43,7 @@ index 121d7a3..68b3ea7 100644
          log::info!("退出清理完成：客户端已指回直连，代理已停止");
 diff --git a/src-tauri/src/personal_proxy.rs b/src-tauri/src/personal_proxy.rs
 new file mode 100644
-index 0000000..102308d
+index 0000000..d75f762
 --- /dev/null
 +++ b/src-tauri/src/personal_proxy.rs
 @@ -0,0 +1,228 @@
@@ -234,7 +234,7 @@ index 0000000..102308d
 +/// Stop only the child process recorded by this application instance.
 +/// Existing gateway processes discovered by port/name are intentionally left alone.
 +pub fn stop_owned_gateway(process: &GatewayProcessState) -> Result<(), &'static str> {
-+    let mut slot = process.0.lock().map_err(|_| "gateway_state_unavailable".to_string())?;
++    let mut slot = process.0.lock().map_err(|_| "gateway_state_unavailable")?;
 +    let Some(mut child) = slot.take() else { return Ok(()); };
 +    if child.try_wait().map_err(|_| "gateway_stop_failed")?.is_some() {
 +        return Ok(());
@@ -276,7 +276,7 @@ index 0000000..102308d
 +    }
 +}
 diff --git a/src-tauri/src/proxy/forwarder.rs b/src-tauri/src/proxy/forwarder.rs
-index 79233af..4217e0b 100644
+index 79233af..32c93aa 100644
 --- a/src-tauri/src/proxy/forwarder.rs
 +++ b/src-tauri/src/proxy/forwarder.rs
 @@ -2703,6 +2703,7 @@ impl RequestForwarder {
@@ -287,7 +287,7 @@ index 79233af..4217e0b 100644
  
          // 托管 OAuth 的 workspace 由账号绑定决定，覆盖客户端或本地代理配置的旧值。
          if let Some(ref account_id) = codex_oauth_account_id {
-@@ -4463,6 +4464,38 @@ fn apply_local_proxy_header_overrides(
+@@ -4463,6 +4464,39 @@ fn apply_local_proxy_header_overrides(
      }
  }
  
@@ -296,9 +296,10 @@ index 79233af..4217e0b 100644
 +/// never stored in ProviderMeta, the provider database, or JavaScript.
 +fn apply_local_gateway_token(
 +    headers: &mut http::HeaderMap,
-+    url: &url::Url,
++    target: &str,
 +    is_copilot: bool,
 +) {
++    let Ok(url) = url::Url::parse(target) else { return; };
 +    if is_copilot || url.scheme() != "http" {
 +        return;
 +    }
@@ -326,7 +327,7 @@ index 79233af..4217e0b 100644
  fn is_protected_local_proxy_override_header(name: &http::HeaderName) -> bool {
      matches!(
          name.as_str(),
-@@ -4481,6 +4514,7 @@ fn is_protected_local_proxy_override_header(name: &http::HeaderName) -> bool {
+@@ -4481,6 +4515,7 @@ fn is_protected_local_proxy_override_header(name: &http::HeaderName) -> bool {
              | "x-api-key"
              | "x-goog-api-key"
              | "chatgpt-account-id"
@@ -334,7 +335,7 @@ index 79233af..4217e0b 100644
              | "session_id"
              | "x-client-request-id"
              | "x-codex-window-id"
-@@ -5051,6 +5085,10 @@ mod tests {
+@@ -5051,6 +5086,10 @@ mod tests {
              headers: HashMap::from([
                  ("User-Agent".to_string(), "custom".to_string()),
                  ("X-Test".to_string(), "ok".to_string()),
@@ -345,7 +346,7 @@ index 79233af..4217e0b 100644
                  ("Authorization".to_string(), "Bearer bad".to_string()),
                  ("Content-Type".to_string(), "text/plain".to_string()),
                  ("X-Bad".to_string(), "bad\nvalue".to_string()),
-@@ -5082,6 +5120,7 @@ mod tests {
+@@ -5082,6 +5121,7 @@ mod tests {
              headers.get("x-test").and_then(|value| value.to_str().ok()),
              Some("ok")
          );
@@ -353,7 +354,7 @@ index 79233af..4217e0b 100644
          assert!(headers.get("x-bad").is_none());
      }
  
-@@ -5107,6 +5146,32 @@ mod tests {
+@@ -5107,6 +5147,32 @@ mod tests {
          );
      }
  
@@ -363,7 +364,7 @@ index 79233af..4217e0b 100644
 +        let mut headers = http::HeaderMap::new();
 +        apply_local_gateway_token(
 +            &mut headers,
-+            &url::Url::parse("http://127.0.0.1:8787/v1/responses").unwrap(),
++            "http://127.0.0.1:8787/v1/responses",
 +            false,
 +        );
 +        assert_eq!(
@@ -376,7 +377,7 @@ index 79233af..4217e0b 100644
 +        let mut external = http::HeaderMap::new();
 +        apply_local_gateway_token(
 +            &mut external,
-+            &url::Url::parse("https://provider.example/v1/responses").unwrap(),
++            "https://provider.example/v1/responses",
 +            false,
 +        );
 +        assert!(external.get("x-codex-gateway-token").is_none());

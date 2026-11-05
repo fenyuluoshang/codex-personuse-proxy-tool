@@ -36,4 +36,4 @@
 
 ## 当前状态
 
-本文件只记录来源和集成约束；上游源码尚未复制到本仓库，固定提交尚未在本机完成隔离构建。真实桌面端和官方登录验收仍属于后续任务。
+两个固定提交的子模块已在 2026-11-05 初始化，并完成隔离构建：CC Switch Renderer/typecheck、Personal Proxy 页面测试、Rust/Tauri Desktop 构建，以及 chatgpt-proxy-manager 的 VerifyOnly、WPF 构建和无参数窗口启动/关闭探测均通过。构建产物只保留在未跟踪的 `.build` 目录；完整 CC Switch 窗口生命周期、Rust 端到端模型链路、真实桌面端、官方登录和代理站验收仍属于后续任务。

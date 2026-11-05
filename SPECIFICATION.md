@@ -1,6 +1,6 @@
 # Codex 个人代理工具：统一需求与实施规格
 
-状态：实施中，2026-11-04。本文合并此前设计，并以用户最新确认的组件复用方案为准。网关、模拟 provider、隔离 Codex CLI、上游固定构建、Windows 恢复补丁和 CC Switch 原 UI 集成补丁已经实现；目标 Windows 桌面版本、官方账号、插件/MCP 和实际代理站仍未完成端到端验证。
+状态：实施中，2026-11-05。本文合并此前设计，并以用户最新确认的组件复用方案为准。网关、模拟 provider、隔离 Codex CLI、上游固定构建、Windows 恢复补丁、CC Switch 原 UI 集成补丁和一次完整的 CC Switch Rust/Tauri Desktop 构建已经实现并验证；目标 Windows 桌面窗口生命周期、官方账号、插件/MCP、CC Switch 到网关的完整模型链路和实际代理站仍未完成端到端验证。
 
 ## 1. 目标和范围
 
